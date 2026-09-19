@@ -17,7 +17,6 @@ import (
 	"github.com/containernetworking/plugins/pkg/ipam"
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/gofrs/flock"
-	"github.com/vishvananda/netlink"
 
 	"github.com/k8snetworkplumbingwg/ib-sriov-cni/pkg/config"
 	"github.com/k8snetworkplumbingwg/ib-sriov-cni/pkg/sriov"
@@ -177,12 +176,11 @@ func getNetConfNetns(args *skel.CmdArgs) (*localtypes.NetConf, ns.NetNS, error) 
 }
 
 // Applies VF config and performs VF setup. if RdmaIsolation is configured, moves RDMA device into namespace
-func doVFConfig(sm localtypes.Manager, netConf *localtypes.NetConf, netns ns.NetNS, args *skel.CmdArgs) (retErr error) {
+func doVFConfig(sm localtypes.Manager, netConf *localtypes.NetConf, netns ns.NetNS, args *skel.CmdArgs) error {
 	err := sm.ApplyVFConfig(netConf)
 	if err != nil {
 		return fmt.Errorf("infiniBand SRI-OV CNI failed to configure VF %q", err)
 	}
-
 	// VFIO devices don't have network interfaces, skip SetupVF
 	if netConf.VfioPciMode {
 		return nil
@@ -198,28 +196,18 @@ func doVFConfig(sm localtypes.Manager, netConf *localtypes.NetConf, netns ns.Net
 		if err != nil {
 			return err
 		}
-		// Save RDMA state
+		// Save RDMA state. From here on the RDMA device is in the pod netns; the cleanup defer in
+		// handleVFAdd moves it back on any later failure.
 		netConf.RdmaNetState.DeviceID = netConf.DeviceID
 		netConf.RdmaNetState.SandboxRdmaDevName = rdmaDev
 		netConf.RdmaNetState.ContainerRdmaDevName = rdmaDev
-		// restore RDMA device back to default namespace in case of error
-		// Note(adrianc): as there is no logging, we have little visibility if the restore operation failed.
-		defer func() {
-			if retErr != nil {
-				_ = utils.MoveRdmaDevFromNs(netConf.RdmaNetState.ContainerRdmaDevName, netns)
-			}
-		}()
 	}
 
+	// No cleanup here on failure: SetupVF may have moved the interface into the pod netns before
+	// failing, and undoing that is the job of the single cleanup defer in handleVFAdd, which also
+	// reports cleanup errors instead of discarding them.
 	err = sm.SetupVF(netConf, args.IfName, args.ContainerID, netns)
 	if err != nil {
-		nsErr := netns.Do(func(_ ns.NetNS) error {
-			_, innerErr := netlink.LinkByName(args.IfName)
-			return innerErr
-		})
-		if nsErr == nil {
-			_ = sm.ReleaseVF(netConf, args.IfName, args.ContainerID, netns)
-		}
 		return fmt.Errorf("failed to set up pod interface %q from the device %q: %v",
 			args.IfName, netConf.DeviceID, err)
 	}
@@ -261,28 +249,59 @@ func runIPAMPlugin(stdinData []byte, netConf *localtypes.NetConf) (_ *current.Re
 	return newResult, nil
 }
 
+// releaseFailedVFAdd moves back to the host netns whatever a failed handleVFAdd left in the pod
+// netns: the VF interface (once SetupVF has moved it) and the RDMA device (once MoveRdmaDevToNsPci
+// has moved it). Errors are returned joined rather than dropped, see handleVFAdd.
+func releaseFailedVFAdd(sm localtypes.Manager, args *skel.CmdArgs, netConf *localtypes.NetConf, netns ns.NetNS) error {
+	var errs []error
+	// SetupVF records the interface's current name immediately after moving it into the pod netns,
+	// and updates it after the final rename. An empty name means the move never completed.
+	if !netConf.VfioPciMode && netConf.ContIFNames != "" {
+		if err := sm.ReleaseVF(netConf, netConf.ContIFNames, args.ContainerID, netns); err != nil {
+			errs = append(errs, fmt.Errorf("failed to release VF: %w", err))
+		}
+	}
+	if netConf.RdmaIsolation && netConf.RdmaNetState.ContainerRdmaDevName != "" {
+		if err := utils.MoveRdmaDevFromNs(netConf.RdmaNetState.ContainerRdmaDevName, netns); err != nil {
+			errs = append(errs, fmt.Errorf("failed to restore RDMA device: %w", err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // handleVFAdd handles VF device configuration in cmdAdd
-func handleVFAdd(args *skel.CmdArgs, netConf *localtypes.NetConf, netns ns.NetNS, result *current.Result) (retErr error) {
-	sm := sriov.NewSriovManager()
+func handleVFAdd(sm localtypes.Manager, args *skel.CmdArgs, netConf *localtypes.NetConf, netns ns.NetNS,
+	result *current.Result) (retErr error) {
+	// ApplyVFConfig writes the pod GUID to the VF. If the ADD then fails, the GUID must not outlive
+	// it: the retry would read it back as the host GUID and DEL would write it back to the idle VF,
+	// where it collides with the next pod given that GUID. Reset the VF on any error. HostIFGUID is
+	// only set once ApplyVFConfig is about to write, so a failure before that resets nothing but the
+	// link state. Registered first so it runs last, after the interface and RDMA device are back in
+	// the host namespace.
+	defer func() {
+		if retErr != nil {
+			if err := sm.ResetVFConfig(netConf); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("resetting the VF after the failed ADD also failed: %w", err))
+			}
+		}
+	}()
+
+	// One cleanup for everything doVFConfig and the steps after it may leave in the pod netns: the
+	// VF interface (once SetupVF has moved it) and the RDMA device (once MoveRdmaDevToNsPci has moved
+	// it). Registered before doVFConfig so it also covers a failure inside SetupVF, and after the
+	// reset defer so it runs first: the reset rebinds the VF and must find it back in the host netns.
+	// Cleanup errors are joined onto the ADD error rather than dropped: the CNI has no log, and the
+	// kubelet message is the only place an operator can see that the VF was left half released.
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, releaseFailedVFAdd(sm, args, netConf, netns))
+		}
+	}()
 
 	err := doVFConfig(sm, netConf, netns, args)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if retErr != nil {
-			nsErr := netns.Do(func(_ ns.NetNS) error {
-				_, innerErr := netlink.LinkByName(args.IfName)
-				return innerErr
-			})
-			if nsErr == nil {
-				_ = sm.ReleaseVF(netConf, args.IfName, args.ContainerID, netns)
-			}
-			if netConf.RdmaIsolation {
-				_ = utils.MoveRdmaDevFromNs(netConf.RdmaNetState.ContainerRdmaDevName, netns)
-			}
-		}
-	}()
 
 	// VFIO devices don't have network interfaces, skip IPAM configuration
 	if netConf.IPAM.Type != "" && !netConf.VfioPciMode {
@@ -356,7 +375,7 @@ func cmdAdd(args *skel.CmdArgs) (retErr error) {
 		}
 	} else {
 		// VF device - continue with normal VF configuration
-		err = handleVFAdd(args, netConf, netns, result)
+		err = handleVFAdd(sriov.NewSriovManager(), args, netConf, netns, result)
 		if err != nil {
 			return err
 		}

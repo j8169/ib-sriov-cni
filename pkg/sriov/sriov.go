@@ -1,8 +1,10 @@
 package sriov
 
 import (
+	"errors"
 	"fmt"
 	"net"
+	"strings"
 
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/k8snetworkplumbingwg/sriovnet"
@@ -19,6 +21,11 @@ type MyNetlink struct {
 // LinkByName implements NetlinkManager
 func (n *MyNetlink) LinkByName(name string) (netlink.Link, error) {
 	return netlink.LinkByName(name)
+}
+
+// LinkByIndex implements NetlinkManager
+func (n *MyNetlink) LinkByIndex(index int) (netlink.Link, error) {
+	return netlink.LinkByIndex(index)
 }
 
 // LinkSetUp using NetlinkManager
@@ -118,21 +125,58 @@ func NewSriovManager() types.Manager {
 	}
 }
 
+// dropAltNames removes every alt name of link that equals one of names. The kernel refuses to rename
+// a device to one of its own alt names (EEXIST), and alt names survive a netns move, so a stale one
+// would break the rename to the pod name on ADD or back to the host name on DEL. With the udev wait in
+// place udev's own rename succeeds and it never records the persistent name as an alt name, so this
+// is reachable only when the wait is disabled in the configuration, times out on the DEL path (where
+// the CNI proceeds), or something outside the CNI added the name. It stays because the DEL rename it
+// protects is the one that would otherwise strand the VF on the host still carrying the pod GUID.
+func (s *sriovManager) dropAltNames(link netlink.Link, names ...string) error {
+	for _, altName := range link.Attrs().AltNames {
+		for _, name := range names {
+			if altName != name {
+				continue
+			}
+			if err := s.nLink.LinkDelAltName(link, altName); err != nil {
+				return fmt.Errorf("failed to remove alt name %s from %s: %v", altName, link.Attrs().Name, err)
+			}
+			break
+		}
+	}
+	return nil
+}
+
 // SetupVF sets up a VF in Pod netns
 func (s *sriovManager) SetupVF(conf *types.NetConf, podifName, cid string, netns ns.NetNS) error {
-	// Get vf name since it may have been changed after the rebind in ApplyVFConfig which is called before
-	linkName, err := utils.GetVFLinkNames(conf.DeviceID)
-	if err != nil || linkName == "" {
-		return fmt.Errorf("failed to get VF %s name after rebind with error, %q", conf.DeviceID, err)
+	// This field tracks whether the current ADD moved the interface and what name it has there.
+	// Do not let cached or input state make failed-ADD cleanup release an interface we did not move.
+	conf.ContIFNames = ""
+	// ApplyVFConfig rebound the VF, so its netdev was just re-created and udev is renaming it
+	// (ib0 -> persistent name) and adding alt names concurrently with us. Find it by ifindex, which
+	// a rename does not change, then wait for udev to finish with it so that the name and alt names
+	// read below are final rather than whatever udev had got to.
+	wait, err := conf.NetdevWait()
+	if err != nil {
+		return err
+	}
+	ifIndex, err := utils.GetVFLinkIndex(conf.DeviceID, wait)
+	if err != nil {
+		return fmt.Errorf("failed to get VF %s netdev after rebind: %v", conf.DeviceID, err)
+	}
+	// A timeout fails the ADD rather than racing udev; the runtime retries, and by then udev is done.
+	if err := utils.WaitForUdevSettled(ifIndex, wait); err != nil && !errors.Is(err, utils.ErrNoUdev) {
+		return fmt.Errorf("VF %s netdev after rebind: %v", conf.DeviceID, err)
 	}
 
-	linkObj, err := s.nLink.LinkByName(linkName)
+	linkObj, err := s.nLink.LinkByIndex(ifIndex)
 	if err != nil {
-		return fmt.Errorf("error getting VF netdevice with name %s", linkName)
+		return fmt.Errorf("error getting VF %s netdevice with ifindex %d: %v", conf.DeviceID, ifIndex, err)
 	}
+	linkName := linkObj.Attrs().Name
 
 	// tempName used as intermediary name to avoid name conflicts
-	tempName := fmt.Sprintf("vfdev%d", linkObj.Attrs().Index)
+	tempName := fmt.Sprintf("vfdev%d", ifIndex)
 
 	// 1. Set link down
 	if err := s.nLink.LinkSetDown(linkObj); err != nil {
@@ -144,29 +188,29 @@ func (s *sriovManager) SetupVF(conf *types.NetConf, podifName, cid string, netns
 		return fmt.Errorf("error setting temp IF name %s for %s", tempName, linkName)
 	}
 
-	// 3. Remove alt name from the nic
-	linkObj, err = s.nLink.LinkByName(tempName)
+	// 3. Drop alt names that would block the renames to the pod name and back to the host name
+	linkObj, err = s.nLink.LinkByIndex(ifIndex)
 	if err != nil {
-		return fmt.Errorf("error getting VF netdevice with name %s: %v", tempName, err)
+		return fmt.Errorf("error getting VF netdevice with ifindex %d: %v", ifIndex, err)
 	}
-	for _, altName := range linkObj.Attrs().AltNames {
-		if altName == linkName {
-			if err := s.nLink.LinkDelAltName(linkObj, linkName); err != nil {
-				return fmt.Errorf("error removing VF altname %s: %v", linkName, err)
-			}
-		}
+	if err := s.dropAltNames(linkObj, linkName, conf.HostIFNames, podifName); err != nil {
+		return err
 	}
 
 	// 4. Change netns
 	if err := s.nLink.LinkSetNsFd(linkObj, int(netns.Fd())); err != nil {
 		return fmt.Errorf("failed to move IF %s to netns: %q", tempName, err)
 	}
+	// From this point cleanup must look in the pod netns. Keep the actual current name so a failure
+	// before the final rename can still move the VF back.
+	conf.ContIFNames = tempName
 
 	if err := netns.Do(func(_ ns.NetNS) error {
 		// 5. Set Pod IF name
 		if err := s.nLink.LinkSetName(linkObj, podifName); err != nil {
 			return fmt.Errorf("error setting container interface name %s for %s", linkName, tempName)
 		}
+		conf.ContIFNames = podifName
 
 		// 6. Bring IF up in Pod netns
 		if err := s.nLink.LinkSetUp(linkObj); err != nil {
@@ -177,8 +221,6 @@ func (s *sriovManager) SetupVF(conf *types.NetConf, podifName, cid string, netns
 	}); err != nil {
 		return fmt.Errorf("error setting up interface in container namespace: %q", err)
 	}
-	conf.ContIFNames = podifName
-
 	return nil
 }
 
@@ -205,6 +247,11 @@ func (s *sriovManager) ReleaseVF(conf *types.NetConf, podifName, cid string, net
 		// shutdown VF device
 		if err = s.nLink.LinkSetDown(linkObj); err != nil {
 			return fmt.Errorf("failed to set link %s down: %q", podifName, err)
+		}
+
+		// an alt name equal to the host name would make the rename below fail (see dropAltNames)
+		if err := s.dropAltNames(linkObj, conf.HostIFNames); err != nil {
+			return err
 		}
 
 		// rename VF device
@@ -240,10 +287,18 @@ func (s *sriovManager) applyVFGuid(conf *types.NetConf, pfLink netlink.Link) err
 				return fmt.Errorf("failed to lookup vf %q: %v", conf.HostIFNames, err)
 			}
 			conf.HostIFGUID = vfLink.Attrs().HardwareAddr.String()[36:]
+			// The VF already carrying this pod's GUID means an earlier ADD wrote it and failed before it
+			// could reset the VF. Do not save it as the host GUID, or DEL would write a pod GUID back onto
+			// the idle VF; treat the VF as having no host GUID so DEL resets it to the default.
+			if strings.EqualFold(conf.HostIFGUID, conf.GUID) {
+				conf.HostIFGUID = utils.DefaultGUID
+			}
 		}
 
 		// Set link guid
-		if err := s.setVfGUID(conf, pfLink, conf.GUID); err != nil {
+		// If the port-GUID write fails after the node-GUID write, put the node GUID back so the VF is
+		// not left with a split identity; the deferred reset in handleVFAdd then rebinds it whole.
+		if err := s.setVfGUID(conf, pfLink, conf.GUID, conf.HostIFGUID); err != nil {
 			return err
 		}
 	} else if !conf.VfioPciMode {
@@ -293,20 +348,32 @@ func (s *sriovManager) ApplyVFConfig(conf *types.NetConf) error {
 
 // restoreVFName restores VF name from conf
 func (s *sriovManager) restoreVFName(conf *types.NetConf) error {
-	linkName, err := utils.GetVFLinkNames(conf.DeviceID)
+	// Same as in SetupVF: the VF was just rebound, so find it by ifindex and let udev finish first.
+	wait, err := conf.NetdevWait()
 	if err != nil {
-		return fmt.Errorf("restoreVFName error: failed to get netdev name for VF %s, %v", conf.DeviceID, err)
+		return fmt.Errorf("restoreVFName error: %v", err)
+	}
+	ifIndex, err := utils.GetVFLinkIndex(conf.DeviceID, wait)
+	if err != nil {
+		return fmt.Errorf("restoreVFName error: failed to get netdev for VF %s, %v", conf.DeviceID, err)
+	}
+	// On the DEL / reset path a slow udev must not fail the teardown; on timeout proceed as before.
+	_ = utils.WaitForUdevSettled(ifIndex, wait)
+
+	linkObj, err := s.nLink.LinkByIndex(ifIndex)
+	if err != nil {
+		return fmt.Errorf("restoreVFName error: failed to get link with ifindex %d for VF %s, %v",
+			ifIndex, conf.DeviceID, err)
 	}
 
+	linkName := linkObj.Attrs().Name
 	if linkName == conf.HostIFNames {
 		// VF has expected name, no need to set it
 		return nil
 	}
 
-	var linkObj netlink.Link
-	linkObj, err = s.nLink.LinkByName(linkName)
-	if err != nil {
-		return fmt.Errorf("restoreVFName error: failed to get link for %s, %v", linkName, err)
+	if err := s.dropAltNames(linkObj, conf.HostIFNames); err != nil {
+		return fmt.Errorf("restoreVFName error: %v", err)
 	}
 
 	err = s.nLink.LinkSetName(linkObj, conf.HostIFNames)
@@ -323,6 +390,7 @@ func (s *sriovManager) ResetVFConfig(conf *types.NetConf) error {
 	if err != nil {
 		return fmt.Errorf("failed to lookup master %q: %v", conf.Master, err)
 	}
+	var errs []error
 
 	// Reset link state to `auto`
 	if conf.LinkState != "" {
@@ -330,7 +398,7 @@ func (s *sriovManager) ResetVFConfig(conf *types.NetConf) error {
 		// specified in the network definition, reset only when link_state was explicitly specified, to
 		// accommodate for drivers / NICs that don't support the netlink command (e.g. igb driver)
 		if err = s.nLink.LinkSetVfState(pfLink, conf.VFID, 0); err != nil {
-			return fmt.Errorf("failed to set link state to auto for vf %d: %v", conf.VFID, err)
+			errs = append(errs, fmt.Errorf("failed to set link state to auto for vf %d: %v", conf.VFID, err))
 		}
 	}
 
@@ -342,24 +410,36 @@ func (s *sriovManager) ResetVFConfig(conf *types.NetConf) error {
 			conf.HostIFGUID = utils.DefaultGUID
 		}
 
-		if err := s.setVfGUID(conf, pfLink, conf.HostIFGUID); err != nil {
-			return err
-		}
-		// setVfGUID cause VF to rebind, which change its name. Lets restore it.
-		// For VFIO devices, skip VF name restoration since no rebind occurs
-		// Once setVfGUID wouldn't do rebind to apply GUID this function should be removed
-		if !conf.VfioPciMode {
-			return s.restoreVFName(conf)
+		// No rollback target on the reset path: the pod GUID is not in the cached NetConf on DEL, and
+		// putting it back would be the wrong direction anyway.
+		if err := s.setVfGUID(conf, pfLink, conf.HostIFGUID, ""); err != nil {
+			errs = append(errs, err)
+		} else if !conf.VfioPciMode {
+			// setVfGUID causes the VF to rebind, which changes its name. Restore it only after
+			// the GUID reset and rebind succeeded.
+			if err := s.restoreVFName(conf); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
-func (s *sriovManager) setVfGUID(conf *types.NetConf, pfLink netlink.Link, guidAddr string) error {
+// setVfGUID writes guidAddr as the VF's node and port GUID and rebinds the VF to apply it. If the
+// port-GUID write fails after the node GUID was written and rollbackTarget is set, the node GUID is
+// written back to rollbackTarget so the VF is not left with a split identity. rollbackTarget is
+// validated before anything is written.
+func (s *sriovManager) setVfGUID(conf *types.NetConf, pfLink netlink.Link, guidAddr, rollbackTarget string) error {
 	guid, err := net.ParseMAC(guidAddr)
 	if err != nil {
 		return fmt.Errorf("failed to parse guid %s: %v", guidAddr, err)
+	}
+	var rollbackGUID net.HardwareAddr
+	if rollbackTarget != "" {
+		if rollbackGUID, err = net.ParseMAC(rollbackTarget); err != nil {
+			return fmt.Errorf("failed to parse rollback guid %s: %w", rollbackTarget, err)
+		}
 	}
 	err = s.nLink.LinkSetVfNodeGUID(pfLink, conf.VFID, guid)
 	if err != nil {
@@ -367,7 +447,14 @@ func (s *sriovManager) setVfGUID(conf *types.NetConf, pfLink netlink.Link, guidA
 	}
 	err = s.nLink.LinkSetVfPortGUID(pfLink, conf.VFID, guid)
 	if err != nil {
-		return fmt.Errorf("failed to add port guid %s: %v", guid, err)
+		portErr := fmt.Errorf("failed to add port guid %s: %v", guid, err)
+		if rollbackGUID == nil {
+			return portErr
+		}
+		if rollbackErr := s.nLink.LinkSetVfNodeGUID(pfLink, conf.VFID, rollbackGUID); rollbackErr != nil {
+			return errors.Join(portErr, fmt.Errorf("failed to roll back node guid to %s: %w", rollbackTarget, rollbackErr))
+		}
+		return portErr
 	}
 	// For VFIO devices, skip rebind as the device is bound to vfio-pci driver
 	// and doesn't have a network interface that can be unbound/rebound
