@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -27,10 +28,16 @@ func LoadConf(bytes []byte) (*types.NetConf, error) {
 	if err := json.Unmarshal(bytes, n); err != nil {
 		return nil, fmt.Errorf("failed to load netconf: %v", err)
 	}
+	// ContIFNames is runtime state recorded after this ADD moves the VF. Never let stdin claim that
+	// the current ADD moved an interface; LoadConfFromCache remains responsible for restoring it on DEL.
+	n.ContIFNames = ""
 
 	// validate that link state is one of supported values
 	if n.LinkState != "" && n.LinkState != "auto" && n.LinkState != "enable" && n.LinkState != "disable" {
 		return nil, fmt.Errorf("invalid link_state value: %s", n.LinkState)
+	}
+	if _, err := n.NetdevWait(); err != nil {
+		return nil, fmt.Errorf("failed to load netconf: %v", err)
 	}
 	return n, nil
 }
@@ -56,7 +63,22 @@ func LoadDeviceInfo(netConf *types.NetConf) error {
 		return nil
 	}
 
-	// Get interface name
+	// Get interface name. This is the name the VF is renamed back to on DEL, so it must be udev's
+	// persistent name, not the kernel default ("ib0") the VF carries for a moment after the rebind
+	// a previous DEL did. Wait for udev to finish with the device before reading it; on a timeout
+	// fail the ADD (nothing has been changed yet and the runtime retries) rather than cache a
+	// transient name. A host without udev has no persistent names to wait for.
+	wait, err := netConf.NetdevWait()
+	if err != nil {
+		return fmt.Errorf("load config: %v", err)
+	}
+	ifIndex, err := utils.GetVFLinkIndex(netConf.DeviceID, wait)
+	if err != nil {
+		return fmt.Errorf("load config: failed to detect VF %s netdev: %v", netConf.DeviceID, err)
+	}
+	if err := utils.WaitForUdevSettled(ifIndex, wait); err != nil && !errors.Is(err, utils.ErrNoUdev) {
+		return fmt.Errorf("load config: VF %s netdev: %v", netConf.DeviceID, err)
+	}
 	hostIFNames, err := utils.GetVFLinkNames(netConf.DeviceID)
 	if err != nil || hostIFNames == "" {
 		return fmt.Errorf("load config: failed to detect VF %s name with error, %q", netConf.DeviceID, err)
