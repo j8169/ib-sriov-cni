@@ -39,6 +39,7 @@ var ts = tmpSysFs{
 		"sys/bus/pci/devices",
 		"sys/bus/pci/drivers/mlx5_core",
 		"sys/bus/pci/drivers/vfio-pci",
+		"run/udev/data",
 		"sys/devices/pci0000:ae/0000:ae:00.0/0000:af:00.1/net/ib0",
 		"sys/devices/pci0000:ae/0000:ae:00.0/0000:af:06.0/net/ib1",
 		"sys/devices/pci0000:ae/0000:ae:00.0/0000:af:06.1/net/ib2",
@@ -46,7 +47,18 @@ var ts = tmpSysFs{
 		"sys/devices/pci0000:00/0000:00:02.0/0000:05:00.0/net/ib4",
 	},
 	fileList: map[string][]byte{
-		"sys/devices/pci0000:ae/0000:ae:00.0/0000:af:00.1/sriov_numvfs": []byte("2"),
+		"sys/devices/pci0000:ae/0000:ae:00.0/0000:af:00.1/sriov_numvfs":    []byte("2"),
+		"sys/devices/pci0000:ae/0000:ae:00.0/0000:af:00.1/net/ib0/ifindex": []byte("1000\n"),
+		"sys/devices/pci0000:ae/0000:ae:00.0/0000:af:06.0/net/ib1/ifindex": []byte("1001\n"),
+		"sys/devices/pci0000:ae/0000:ae:00.0/0000:af:06.1/net/ib2/ifindex": []byte("1002\n"),
+		"sys/devices/pci0000:00/0000:00:02.0/0000:05:00.0/net/ib3/ifindex": []byte("1003\n"),
+		"sys/devices/pci0000:00/0000:00:02.0/0000:05:00.0/net/ib4/ifindex": []byte("1004\n"),
+		// udev "finished processing" records for the fake netdevs (see WaitForUdevSettled)
+		"run/udev/data/n1000": []byte("I:1789340000000000\nE:ID_NET_NAME=ib0\nG:systemd\n"),
+		"run/udev/data/n1001": []byte("I:1789340000000000\nE:ID_NET_NAME=ib1\nG:systemd\n"),
+		"run/udev/data/n1002": []byte("I:1789340000000000\nE:ID_NET_NAME=ib2\nG:systemd\n"),
+		"run/udev/data/n1003": []byte("I:1789340000000000\nE:ID_NET_NAME=ib3\nG:systemd\n"),
+		"run/udev/data/n1004": []byte("I:1789340000000000\nE:ID_NET_NAME=ib4\nG:systemd\n"),
 		"sys/devices/pci0000:00/0000:00:02.0/0000:05:00.0/sriov_numvfs": []byte("0"),
 	},
 	netSymlinks: map[string]string{
@@ -134,6 +146,7 @@ func CreateTmpSysFs() error {
 
 	SysBusPci = filepath.Join(ts.dirRoot, SysBusPci)
 	NetDirectory = filepath.Join(ts.dirRoot, NetDirectory)
+	UdevDataDir = filepath.Join(ts.dirRoot, UdevDataDir)
 	return nil
 }
 

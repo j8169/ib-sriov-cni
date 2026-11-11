@@ -3,6 +3,8 @@ package sriov
 import (
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
 
 	"github.com/containernetworking/plugins/pkg/ns"
 	. "github.com/onsi/ginkgo/v2"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/k8snetworkplumbingwg/ib-sriov-cni/pkg/types"
 	"github.com/k8snetworkplumbingwg/ib-sriov-cni/pkg/types/mocks"
+	"github.com/k8snetworkplumbingwg/ib-sriov-cni/pkg/utils"
 )
 
 // FakeLink is a dummy netlink struct used during testing
@@ -332,7 +335,6 @@ var _ = Describe("Sriov", func() {
 					DeviceID:    "0000:af:06.0",
 					VFID:        0,
 					HostIFNames: "ib1",
-					ContIFNames: "net1",
 				},
 			}
 		})
@@ -346,7 +348,7 @@ var _ = Describe("Sriov", func() {
 				Name:  "dummylink",
 			}}
 
-			mocked.On("LinkByName", mock.AnythingOfType("string")).Return(fakeLink, nil)
+			mocked.On("LinkByIndex", 1001).Return(fakeLink, nil)
 			mocked.On("LinkSetDown", fakeLink).Return(nil)
 			mocked.On("LinkSetName", fakeLink, mock.Anything).Return(nil)
 			mocked.On("LinkSetNsFd", fakeLink, mock.AnythingOfType("int")).Return(nil)
@@ -354,12 +356,13 @@ var _ = Describe("Sriov", func() {
 			sm := sriovManager{nLink: mocked}
 			err := sm.SetupVF(netconf, podifName, contID, targetNetNS)
 			Expect(err).NotTo(HaveOccurred())
+			Expect(netconf.ContIFNames).To(Equal(podifName))
 		})
 		It("Assuming non existing interface", func() {
 			targetNetNS := newFakeNs()
 			mocked := &mocks.NetlinkManager{}
 
-			mocked.On("LinkByName", mock.AnythingOfType("string")).Return(nil, errors.New("not fount"))
+			mocked.On("LinkByIndex", 1001).Return(nil, errors.New("not fount"))
 			sm := sriovManager{nLink: mocked}
 			err := sm.SetupVF(netconf, podifName, contID, targetNetNS)
 			Expect(err).To(HaveOccurred())
@@ -373,7 +376,7 @@ var _ = Describe("Sriov", func() {
 				Name:  "dummylink",
 			}}
 
-			mocked.On("LinkByName", mock.AnythingOfType("string")).Return(fakeLink, nil)
+			mocked.On("LinkByIndex", 1001).Return(fakeLink, nil)
 			mocked.On("LinkSetDown", fakeLink).Return(errors.New("failed"))
 			sm := sriovManager{nLink: mocked}
 			err := sm.SetupVF(netconf, podifName, contID, targetNetNS)
@@ -388,7 +391,7 @@ var _ = Describe("Sriov", func() {
 				Name:  "dummylink",
 			}}
 
-			mocked.On("LinkByName", mock.AnythingOfType("string")).Return(fakeLink, nil)
+			mocked.On("LinkByIndex", 1001).Return(fakeLink, nil)
 			mocked.On("LinkSetDown", fakeLink).Return(nil)
 			mocked.On("LinkSetName", fakeLink, mock.Anything).Return(errors.New("failed"))
 			sm := sriovManager{nLink: mocked}
@@ -404,7 +407,7 @@ var _ = Describe("Sriov", func() {
 				Name:  "dummylink",
 			}}
 
-			mocked.On("LinkByName", mock.AnythingOfType("string")).Return(fakeLink, nil)
+			mocked.On("LinkByIndex", 1001).Return(fakeLink, nil)
 			mocked.On("LinkSetDown", fakeLink).Return(nil)
 			mocked.On("LinkSetName", fakeLink, mock.Anything).Return(nil)
 			mocked.On("LinkSetNsFd", fakeLink, mock.Anything).Return(errors.New("failed"))
@@ -416,21 +419,64 @@ var _ = Describe("Sriov", func() {
 			targetNetNS := newFakeNs()
 			mocked := &mocks.NetlinkManager{}
 
+			// "ib1" is the host name the VF is renamed back to on release, "dummylink" is its current
+			// name, and "net1" is the next rename target. All three must be dropped; "enp175s6" stays.
 			fakeLink := &FakeLink{netlink.LinkAttrs{
-				Index:    1000,
+				Index:    1001,
 				Name:     "dummylink",
-				AltNames: []string{"enp175s6"},
+				AltNames: []string{"enp175s6", "ib1", "dummylink", podifName},
 			}}
 
-			mocked.On("LinkByName", mock.AnythingOfType("string")).Return(fakeLink, nil)
+			mocked.On("LinkByIndex", 1001).Return(fakeLink, nil)
 			mocked.On("LinkSetDown", fakeLink).Return(nil)
 			mocked.On("LinkSetName", fakeLink, mock.Anything).Return(nil)
-			mocked.On("LinkDelAltName", fakeLink, "enp175s6").Return(nil)
+			mocked.On("LinkDelAltName", fakeLink, "ib1").Return(nil)
+			mocked.On("LinkDelAltName", fakeLink, "dummylink").Return(nil)
+			mocked.On("LinkDelAltName", fakeLink, podifName).Return(nil)
 			mocked.On("LinkSetNsFd", fakeLink, mock.AnythingOfType("int")).Return(nil)
 			mocked.On("LinkSetUp", fakeLink).Return(nil)
 			sm := sriovManager{nLink: mocked}
 			err := sm.SetupVF(netconf, podifName, contID, targetNetNS)
 			Expect(err).NotTo(HaveOccurred())
+			mocked.AssertCalled(GinkgoT(), "LinkDelAltName", fakeLink, "ib1")
+			mocked.AssertCalled(GinkgoT(), "LinkDelAltName", fakeLink, "dummylink")
+			mocked.AssertCalled(GinkgoT(), "LinkDelAltName", fakeLink, podifName)
+			mocked.AssertNotCalled(GinkgoT(), "LinkDelAltName", fakeLink, "enp175s6")
+		})
+		It("Does not manipulate the interface while udev is still renaming it", func() {
+			record := filepath.Join(utils.UdevDataDir, "n1001")
+			original, err := os.ReadFile(record)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { Expect(os.WriteFile(record, original, 0o644)).To(Succeed()) })
+			Expect(os.WriteFile(record, []byte("I:123\nE:ID_RENAMING=1\n"), 0o644)).To(Succeed())
+			netconf.UdevSettleTimeout = "1s"
+			mocked := &mocks.NetlinkManager{}
+			sm := sriovManager{nLink: mocked}
+
+			err = sm.SetupVF(netconf, podifName, contID, newFakeNs())
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("udev did not finish"))
+			Expect(mocked.Calls).To(BeEmpty())
+		})
+		It("Never looks the VF up by name (udev rename race)", func() {
+			// The netdev is found by ifindex from the VF's PCI sysfs entry, and the temp rename
+			// uses that ifindex, so a udev rename at any point cannot make the lookup fail.
+			targetNetNS := newFakeNs()
+			mocked := &mocks.NetlinkManager{}
+
+			fakeLink := &FakeLink{netlink.LinkAttrs{Index: 1001, Name: "ib0"}}
+
+			mocked.On("LinkByIndex", 1001).Return(fakeLink, nil)
+			mocked.On("LinkSetDown", fakeLink).Return(nil)
+			mocked.On("LinkSetName", fakeLink, "vfdev1001").Return(nil)
+			mocked.On("LinkSetNsFd", fakeLink, mock.AnythingOfType("int")).Return(nil)
+			mocked.On("LinkSetName", fakeLink, podifName).Return(nil)
+			mocked.On("LinkSetUp", fakeLink).Return(nil)
+			sm := sriovManager{nLink: mocked}
+			err := sm.SetupVF(netconf, podifName, contID, targetNetNS)
+			Expect(err).NotTo(HaveOccurred())
+			mocked.AssertNotCalled(GinkgoT(), "LinkByName", mock.Anything)
+			mocked.AssertCalled(GinkgoT(), "LinkSetName", fakeLink, "vfdev1001")
 		})
 	})
 	Context("Checking ReleaseVF function", func() {
@@ -465,6 +511,25 @@ var _ = Describe("Sriov", func() {
 			sm := sriovManager{nLink: mocked}
 			err := sm.ReleaseVF(netconf, podifName, contID, targetNetNS)
 			Expect(err).NotTo(HaveOccurred())
+		})
+		It("Host name held as alt name is dropped before the rename back", func() {
+			// Reproduced on hardware: an alt name equal to the host name added while the VF is in the
+			// pod makes LinkSetName fail with EEXIST on DEL, stranding the VF with the pod GUID.
+			targetNetNS := newFakeNs()
+			mocked := &mocks.NetlinkManager{}
+			fakeLink := &FakeLink{netlink.LinkAttrs{Index: 1000, Name: "net1", AltNames: []string{"other", netconf.HostIFNames}}}
+
+			mocked.On("LinkByName", mock.AnythingOfType("string")).Return(fakeLink, nil)
+			mocked.On("LinkSetDown", fakeLink).Return(nil)
+			mocked.On("LinkDelAltName", fakeLink, netconf.HostIFNames).Return(nil)
+			mocked.On("LinkSetName", fakeLink, netconf.HostIFNames).Return(nil)
+			mocked.On("LinkSetNsFd", fakeLink, mock.AnythingOfType("int")).Return(nil)
+			sm := sriovManager{nLink: mocked}
+			err := sm.ReleaseVF(netconf, podifName, contID, targetNetNS)
+			Expect(err).NotTo(HaveOccurred())
+			mocked.AssertCalled(GinkgoT(), "LinkDelAltName", fakeLink, netconf.HostIFNames)
+			mocked.AssertNotCalled(GinkgoT(), "LinkDelAltName", fakeLink, "other")
+			mocked.AssertCalled(GinkgoT(), "LinkSetName", fakeLink, netconf.HostIFNames)
 		})
 		It("Assuming non existing interface", func() {
 			targetNetNS := newFakeNs()
@@ -521,6 +586,7 @@ var _ = Describe("Sriov", func() {
 			}}
 
 			mocked.On("LinkByName", mock.AnythingOfType("string")).Return(fakeLink, nil)
+			mocked.On("LinkByIndex", mock.AnythingOfType("int")).Return(fakeLink, nil)
 			mocked.On("LinkSetDown", fakeLink).Return(nil)
 			mocked.On("LinkSetName", fakeLink, mock.Anything).Return(nil)
 			mocked.On("LinkSetNsFd", fakeLink, mock.AnythingOfType("int")).Return(nil)
@@ -555,6 +621,7 @@ var _ = Describe("Sriov", func() {
 
 			mockedNetLinkManger.On("LinkSetName", fakeLink, netconf.HostIFNames).Return(nil)
 			mockedNetLinkManger.On("LinkByName", mock.AnythingOfType("string")).Return(fakeLink, nil)
+			mockedNetLinkManger.On("LinkByIndex", mock.AnythingOfType("int")).Return(fakeLink, nil)
 			mockedNetLinkManger.On("LinkSetVfNodeGUID", fakeLink, mock.AnythingOfType("int"), mock.Anything).Return(nil)
 			mockedNetLinkManger.On("LinkSetVfPortGUID", fakeLink, mock.AnythingOfType("int"), mock.Anything).Return(nil)
 
@@ -564,12 +631,37 @@ var _ = Describe("Sriov", func() {
 			err := sm.ResetVFConfig(netconf)
 			Expect(err).NotTo(HaveOccurred())
 		})
+		It("ResetVFConfig with valid GUID - host name held as alt name is dropped before the rename", func() {
+			mockedNetLinkManger := &mocks.NetlinkManager{}
+			mockedPciUtils := &mocks.PciUtils{}
+
+			// udev renamed the VF to its persistent name and recorded it as an alt name; the CNI
+			// then renamed it. Renaming back would fail with EEXIST unless the alt name goes first.
+			fakeLink := &FakeLink{netlink.LinkAttrs{Name: "ib0", AltNames: []string{netconf.HostIFNames, "other"}}}
+			netconf.HostIFGUID = "01:23:45:67:89:ab:cd:ef"
+
+			mockedNetLinkManger.On("LinkByName", mock.AnythingOfType("string")).Return(fakeLink, nil)
+			mockedNetLinkManger.On("LinkByIndex", mock.AnythingOfType("int")).Return(fakeLink, nil)
+			mockedNetLinkManger.On("LinkSetVfNodeGUID", fakeLink, mock.AnythingOfType("int"), mock.Anything).Return(nil)
+			mockedNetLinkManger.On("LinkSetVfPortGUID", fakeLink, mock.AnythingOfType("int"), mock.Anything).Return(nil)
+			mockedNetLinkManger.On("LinkDelAltName", fakeLink, netconf.HostIFNames).Return(nil)
+			mockedNetLinkManger.On("LinkSetName", fakeLink, netconf.HostIFNames).Return(nil)
+			mockedPciUtils.On("RebindVf", mock.AnythingOfType("string"), mock.AnythingOfType("string")).Return(nil)
+
+			sm := sriovManager{nLink: mockedNetLinkManger, utils: mockedPciUtils}
+			err := sm.ResetVFConfig(netconf)
+			Expect(err).NotTo(HaveOccurred())
+			mockedNetLinkManger.AssertCalled(GinkgoT(), "LinkDelAltName", fakeLink, netconf.HostIFNames)
+			mockedNetLinkManger.AssertNotCalled(GinkgoT(), "LinkDelAltName", fakeLink, "other")
+			mockedNetLinkManger.AssertCalled(GinkgoT(), "LinkSetName", fakeLink, netconf.HostIFNames)
+		})
 		It("ResetVFConfig without GUID", func() {
 			mockedNetLinkManger := &mocks.NetlinkManager{}
 			mockedPciUtils := &mocks.PciUtils{}
 
 			fakeLink := &FakeLink{netlink.LinkAttrs{}}
 			mockedNetLinkManger.On("LinkByName", mock.AnythingOfType("string")).Return(fakeLink, nil)
+			mockedNetLinkManger.On("LinkByIndex", mock.AnythingOfType("int")).Return(fakeLink, nil)
 
 			sm := sriovManager{nLink: mockedNetLinkManger, utils: mockedPciUtils}
 			err := sm.ResetVFConfig(netconf)
@@ -584,6 +676,7 @@ var _ = Describe("Sriov", func() {
 
 			mockedNetLinkManger.On("LinkSetName", fakeLink, netconf.HostIFNames).Return(nil)
 			mockedNetLinkManger.On("LinkByName", mock.AnythingOfType("string")).Return(fakeLink, nil)
+			mockedNetLinkManger.On("LinkByIndex", mock.AnythingOfType("int")).Return(fakeLink, nil)
 			mockedNetLinkManger.On("LinkSetVfNodeGUID", fakeLink, mock.AnythingOfType("int"), mock.Anything).Return(nil)
 			mockedNetLinkManger.On("LinkSetVfPortGUID", fakeLink, mock.AnythingOfType("int"), mock.Anything).Return(nil)
 
@@ -602,6 +695,7 @@ var _ = Describe("Sriov", func() {
 			netconf.HostIFGUID = "12312-123:434"
 
 			mockedNetLinkManger.On("LinkByName", mock.AnythingOfType("string")).Return(fakeLink, nil)
+			mockedNetLinkManger.On("LinkByIndex", mock.AnythingOfType("int")).Return(fakeLink, nil)
 
 			sm := sriovManager{nLink: mockedNetLinkManger, utils: mockedPciUtils}
 			err := sm.ResetVFConfig(netconf)

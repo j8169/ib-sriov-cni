@@ -208,6 +208,20 @@ echo 8 > /sys/class/net/ib0/device/sriov_numvfs
 about the system requirements to support this mode of operation can be found [here](https://github.com/Mellanox/rdma-cni)
 * `ibKubernetesEnabled` (bool, optional): Enforces ib-sriov-cni to work with [ib-kubernetes](https://www.github.com/Mellanox/ib-kubernetes).
 * `vfioPciMode` (boolean, optional): Enable VFIO mode for devices (VF or PF) bound to vfio-pci driver. When enabled, the CNI skips network interface configuration as VFIO devices are used for direct device assignment (e.g., for kubevirt/VM workloads). Defaults to false. If not explicitly set, the mode is auto-detected based on the device's driver binding.
+* `vfNetdevLookupAttempts` (integer, optional) and `vfNetdevLookupInterval` (duration string, optional): how often and how long the CNI looks for the VF's network interface after the rebind that applies the GUID, while the interface is not yet registered or its sysfs entry is being renamed. Defaults: 20 attempts, `"50ms"` apart. For `vfNetdevLookupAttempts`, `0` has the same meaning as omitting the field and uses the default.
+* `udevSettleTimeout` (duration string, optional): how long the CNI waits for udev to finish processing the VF's network interface (persistent name and alternative names applied) before it touches the interface, on ADD after the rebind and before recording the host interface name, and on DEL before renaming the interface back. On ADD a timeout fails the attach so the runtime retries it; on DEL the CNI proceeds. Default `"3s"`, minimum `"1s"` (udev needs 0.1 to 1.5 s to finish with a freshly rebound VF on the hardware measured so far). The wait cannot be disabled: skipping it is the rename race this version removes. A host without udev (no `/run/udev/data`) is detected and skips the wait without configuration.
+* `udevSettlePoll` (duration string, optional): how often the udev record is re-read while waiting. Default `"25ms"`.
+
+> **How the udev wait works, and what it depends on.** The plugin decides that udev has finished with the VF's network
+> interface by reading systemd-udevd's database record for it, `/run/udev/data/n<ifindex>`, and checking two facts:
+> the record has an `I:` (initialized) line, and it does not contain the line `E:ID_RENAMING=1`, which udevd writes
+> before it renames the interface and removes after the kernel's move event. That file format is systemd's internal
+> database, not a public API; libsystemd's `sd_device_get_is_initialized` and `ID_RENAMING` property lookup answer the
+> same question by reading the same file, and using them would require cgo or a glibc-dynamic binary. The plugin stays a
+> static binary and reads the file directly. Tests cover the initialized and renaming record states.
+> If the expected initialized record never appears, ADD fails with a timeout; DEL proceeds with name restoration.
+> A host without `/run/udev/data` skips the wait. A timeout after GUID programming does not restore the GUID;
+> failed ADD GUID rollback is a separate concern tracked in issue #217.
 
 > *__Note__*: PF passthrough is only supported in VFIO mode. When using a PF device, it must be bound to the vfio-pci driver and `vfioPciMode` must be enabled (or auto-detected). Moving a PF's InfiniBand interface into a pod network namespace is not supported.
 
